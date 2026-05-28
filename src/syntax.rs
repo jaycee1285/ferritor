@@ -42,7 +42,10 @@ impl SyntaxHighlighter {
         }
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if let Some(syntax) = self.syntax_set.find_syntax_by_extension(&ext.to_lowercase()) {
+            if let Some(syntax) = self
+                .syntax_set
+                .find_syntax_by_extension(&ext.to_lowercase())
+            {
                 return syntax;
             }
         }
@@ -55,7 +58,10 @@ impl SyntaxHighlighter {
     }
 
     fn find_known_web_syntax(&self, path: &std::path::Path) -> Option<&SyntaxReference> {
-        let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())?
+            .to_ascii_lowercase();
         match ext.as_str() {
             "ts" | "tsx" => self
                 .syntax_set

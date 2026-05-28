@@ -1,0 +1,19 @@
+/target/
+result
+status.yaml
+
+# Local cloned/reference repos (session-only).
+comrak/
+egui-file-dialog/
+shadcn-rs/
+ink/
+markdown-table-formatter/
+ob-table-enhancer/
+rustdown/
+skim/
+
+# Ignore markdown notes/docs.
+*.md
+
+# Ignore dot-directories anywhere in the repo.
+**/.*/
