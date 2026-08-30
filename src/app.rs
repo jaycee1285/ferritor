@@ -12,12 +12,48 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
 
 // --- Undo/Redo ---
 
 const UNDO_GROUP_SIZE: usize = 20;
 const UNDO_MAX_DEPTH: usize = 5;
 const RECENTS_CAP: usize = 5;
+const THEME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    canonical_path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileFingerprint {
+    fn capture(path: Option<PathBuf>) -> Option<Self> {
+        let path = path?;
+        let metadata = fs::metadata(&path).ok()?;
+        Some(Self {
+            canonical_path: fs::canonicalize(&path).unwrap_or(path),
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThemeFingerprint {
+    gtk: Option<FileFingerprint>,
+    syntect: Option<FileFingerprint>,
+}
+
+impl ThemeFingerprint {
+    fn capture() -> Self {
+        Self {
+            gtk: FileFingerprint::capture(Some(GtkTheme::source_path())),
+            syntect: FileFingerprint::capture(SyntaxHighlighter::theme_path()),
+        }
+    }
+}
 
 struct UndoHistory {
     undo_stack: Vec<String>,
@@ -138,6 +174,8 @@ enum OverlayState {
     Rename,
     Create,
     Delete,
+    CutConfirm,
+    FileAction,
     DirtyNav,
     Help,
 }
@@ -184,6 +222,9 @@ enum AppAction {
     },
     OpenDeleteDialog {
         targets: Vec<PathBuf>,
+    },
+    OpenCutDialog {
+        sources: Vec<PathBuf>,
     },
     SetFileClipboard {
         sources: Vec<PathBuf>,
@@ -250,6 +291,9 @@ struct CollectedIntents {
     ctrl_r: bool,
     ctrl_n: bool,
     ctrl_shift_n: bool,
+    ctrl_c: bool,
+    ctrl_x: bool,
+    ctrl_v: bool,
     key_e: bool,
     alt_r: bool,
     alt_c: bool,
@@ -316,6 +360,11 @@ impl FileRow {
 
 pub struct FerritorApp {
     pub theme: GtkTheme,
+    heading_color: egui::Color32,
+    syntax_highlighter: SyntaxHighlighter,
+    theme_fingerprint: ThemeFingerprint,
+    pending_theme_fingerprint: Option<ThemeFingerprint>,
+    last_theme_check: Instant,
     current_dir: PathBuf,
     selected_file: Option<PathBuf>,
     loaded_content: Option<String>,
@@ -382,6 +431,9 @@ pub struct FerritorApp {
     // File clipboard
     clipboard_paths: Vec<PathBuf>,
     clipboard_is_cut: bool,
+    show_cut_dialog: bool,
+    pending_cut_paths: Vec<PathBuf>,
+    file_action_confirmation: Option<String>,
     // Delete confirmation
     show_delete_dialog: bool,
     delete_targets: Vec<PathBuf>,
@@ -396,50 +448,12 @@ pub struct FerritorApp {
 impl FerritorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, file_arg: Option<PathBuf>) -> Self {
         let theme = GtkTheme::load();
-        let dark_mode = theme.is_dark();
+        let heading_color = theme.heading_fg();
+        let syntax_highlighter = SyntaxHighlighter::new(heading_color);
+        let theme_fingerprint = ThemeFingerprint::capture();
         let shadcn_palette = shadcn_palette_from_gtk(&theme);
 
-        let mut visuals = if dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-        visuals.override_text_color = Some(theme.view_fg());
-        visuals.weak_text_color = Some(theme.muted_fg());
-        visuals.panel_fill = theme.view_bg();
-        visuals.window_fill = theme.dialog_bg();
-        visuals.window_stroke = egui::Stroke::new(1.0, theme.border());
-        visuals.extreme_bg_color = theme.view_bg();
-        visuals.faint_bg_color = theme.shade();
-        visuals.text_edit_bg_color = Some(theme.view_bg());
-        visuals.code_bg_color = theme.view_bg();
-        visuals.warn_fg_color = theme.warning();
-        visuals.error_fg_color = theme.error();
-        visuals.selection.bg_fill = theme.selection_bg();
-        visuals.selection.stroke = egui::Stroke::new(1.0, theme.selection_stroke());
-        visuals.widgets.noninteractive.bg_fill = theme.view_bg();
-        visuals.widgets.noninteractive.weak_bg_fill = theme.view_bg();
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.border());
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.view_fg());
-        visuals.widgets.inactive.bg_fill = theme.card_bg();
-        visuals.widgets.inactive.weak_bg_fill = theme.card_bg();
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme.border());
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.card_fg());
-        visuals.widgets.hovered.bg_fill = theme.hover_bg();
-        visuals.widgets.hovered.weak_bg_fill = theme.hover_bg();
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.accent());
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2, theme.view_fg());
-        visuals.widgets.active.bg_fill = theme.accent();
-        visuals.widgets.active.weak_bg_fill = theme.accent();
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme.accent());
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2, theme.accent_fg());
-        visuals.widgets.open.bg_fill = theme.popover_bg();
-        visuals.widgets.open.weak_bg_fill = theme.popover_bg();
-        visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme.border());
-        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, theme.popover_fg());
-        visuals.text_cursor.stroke = egui::Stroke::new(2.0, theme.accent());
-
-        cc.egui_ctx.set_visuals(visuals);
+        apply_egui_visuals(&cc.egui_ctx, &theme);
         load_fonts(&cc.egui_ctx);
 
         // Resolve starting directory from file arg or cwd
@@ -479,6 +493,11 @@ impl FerritorApp {
 
         let mut app = Self {
             theme,
+            heading_color,
+            syntax_highlighter,
+            theme_fingerprint,
+            pending_theme_fingerprint: None,
+            last_theme_check: Instant::now(),
             current_dir: current_dir.clone(),
             selected_file: None,
             loaded_content: None,
@@ -540,6 +559,9 @@ impl FerritorApp {
             selected_paths: HashSet::new(),
             clipboard_paths: Vec::new(),
             clipboard_is_cut: false,
+            show_cut_dialog: false,
+            pending_cut_paths: Vec::new(),
+            file_action_confirmation: None,
             show_delete_dialog: false,
             delete_targets: Vec::new(),
             delete_focus: 0,
@@ -557,6 +579,46 @@ impl FerritorApp {
         }
 
         app
+    }
+
+    fn refresh_theme_if_needed(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(THEME_POLL_INTERVAL);
+        if self.last_theme_check.elapsed() < THEME_POLL_INTERVAL {
+            return;
+        }
+        self.last_theme_check = Instant::now();
+
+        let fingerprint = ThemeFingerprint::capture();
+        if fingerprint == self.theme_fingerprint {
+            self.pending_theme_fingerprint = None;
+            return;
+        }
+
+        // Theme switchers commonly replace several files in quick succession.
+        // Require one stable poll before adopting the new set.
+        if self.pending_theme_fingerprint.as_ref() != Some(&fingerprint) {
+            self.pending_theme_fingerprint = Some(fingerprint);
+            return;
+        }
+
+        // Keep the last valid state if a replacement file is temporarily
+        // incomplete or otherwise cannot be parsed.
+        let Some(theme) = GtkTheme::try_load() else {
+            return;
+        };
+        let heading_color = theme.heading_fg();
+        let Some(syntax_highlighter) = SyntaxHighlighter::try_new(heading_color) else {
+            return;
+        };
+
+        apply_egui_visuals(ctx, &theme);
+        self.shadcn_theme = Theme::new(shadcn_palette_from_gtk(&theme));
+        self.theme = theme;
+        self.heading_color = heading_color;
+        self.syntax_highlighter = syntax_highlighter;
+        self.theme_fingerprint = fingerprint;
+        self.pending_theme_fingerprint = None;
+        ctx.request_repaint();
     }
 
     // --- Tree building ---
@@ -1090,52 +1152,86 @@ impl FerritorApp {
             return;
         }
         let target_dir = self.cursor_target_dir();
-        let mut pasted = 0;
+        let is_cut = self.clipboard_is_cut;
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
 
         for source in self.clipboard_paths.clone() {
             let file_name = match source.file_name() {
                 Some(n) => n.to_os_string(),
-                None => continue,
+                None => {
+                    failed.push(source);
+                    continue;
+                }
             };
-            let dest = unique_path(target_dir.join(&file_name));
-            let result = if source.is_dir() {
-                copy_dir_recursive(&source, &dest)
+            let direct_dest = target_dir.join(&file_name);
+            if is_cut && direct_dest == source {
+                // Pasting a cut item back into its existing parent is a no-op.
+                completed.push((source.clone(), source));
+                continue;
+            }
+            if source.is_dir() && target_dir.starts_with(&source) {
+                failed.push(source);
+                continue;
+            }
+
+            let dest = unique_path(direct_dest);
+            let result = if is_cut {
+                move_path(&source, &dest)
             } else {
-                fs::copy(&source, &dest).map(|_| ())
+                copy_path(&source, &dest)
             };
-            if result.is_ok() {
-                pasted += 1;
+            match result {
+                Ok(()) => completed.push((source, dest)),
+                Err(_) => failed.push(source),
             }
         }
 
-        if self.clipboard_is_cut && pasted > 0 {
-            let cut_sources: Vec<PathBuf> = self.clipboard_paths.drain(..).collect();
-            let mut should_close_file = false;
-            for source in &cut_sources {
-                if source.is_dir() {
-                    let _ = fs::remove_dir_all(source);
-                } else {
-                    let _ = fs::remove_file(source);
+        let failed_count = failed.len();
+        if is_cut {
+            for (source, dest) in &completed {
+                if source == dest {
+                    continue;
                 }
-                if self.selected_file.as_ref() == Some(source) {
-                    should_close_file = true;
+                if let Some(open_file) = self.selected_file.clone() {
+                    if let Ok(relative) = open_file.strip_prefix(source) {
+                        self.selected_file = Some(dest.join(relative));
+                    }
                 }
-                self.expanded_dirs.retain(|p| !p.starts_with(source));
+                self.expanded_dirs = self
+                    .expanded_dirs
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(source)
+                            .map(|relative| dest.join(relative))
+                            .unwrap_or_else(|_| path.clone())
+                    })
+                    .collect();
                 self.selected_paths.remove(source);
             }
-            if should_close_file {
-                self.close_file();
-            }
-            self.clipboard_is_cut = false;
+            self.clipboard_paths = failed;
+            self.clipboard_is_cut = !self.clipboard_paths.is_empty();
         }
 
-        if pasted > 0 {
-            // Ensure target dir is expanded
+        if !completed.is_empty() {
             if target_dir != self.current_dir {
                 self.expanded_dirs.insert(target_dir);
             }
-            self.last_message = Some(format!("Pasted {} item(s)", pasted));
         }
+        let verb = if is_cut { "Moved" } else { "Copied" };
+        let message = if failed_count == 0 {
+            format!("{} {} item(s)", verb, completed.len())
+        } else {
+            format!(
+                "{} {} item(s); {} failed",
+                verb,
+                completed.len(),
+                failed_count
+            )
+        };
+        self.last_message = Some(message.clone());
+        self.file_action_confirmation = Some(message);
+        self.enter_dialog_mode();
         self.refresh_nav_rows();
     }
 
@@ -1221,10 +1317,6 @@ impl FerritorApp {
         self.open_dir_input_wants_focus = true;
         self.open_dir_show_suggestions = false;
         self.open_dir_autocomplete_cursor = 0;
-        // Index home directory for autocomplete suggestions
-        if let Some(home) = dirs::home_dir() {
-            self.fuzzy_search.open_for_root(home);
-        }
         self.enter_dialog_mode();
         if let Some(status) = &self.open_dir_fallback_status {
             self.last_message = Some(format!("{status}"));
@@ -1501,78 +1593,61 @@ impl FerritorApp {
         }
     }
 
-    /// Get directory suggestions for the current open_dir_input from fuzzy search index.
+    /// Complete the final component of the typed path from its parent directory.
+    /// This deliberately does not use the fuzzy file index: that index contains
+    /// files, applies ignore rules, and is capped, none of which should affect
+    /// direct directory-path completion.
     fn get_open_dir_suggestions(&self) -> Vec<String> {
-        let input = &self.open_dir_input;
+        let input = self.open_dir_input.trim();
         if input.is_empty() {
             return Vec::new();
         }
 
         let expanded = Self::expand_user_path(input);
-        let expanded_str = expanded.to_string_lossy();
-        let expanded_lower = expanded_str.to_lowercase();
-        
-        use std::collections::HashSet;
-        let mut seen = HashSet::new();
+        let ends_with_separator = input.ends_with(std::path::MAIN_SEPARATOR);
+        let (parent, prefix) = if ends_with_separator {
+            (expanded.as_path(), "")
+        } else {
+            let Some(parent) = expanded.parent() else {
+                return Vec::new();
+            };
+            let prefix = expanded
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            (parent, prefix)
+        };
+        let prefix_lower = prefix.to_lowercase();
 
-        // Scan all indexed paths for matches
-        for (_label, path) in self.fuzzy_search.labels().iter().zip(self.fuzzy_search.candidates().iter()) {
-            let path_str = path.to_string_lossy();
-            let path_lower = path_str.to_lowercase();
-            
-            // Check if path starts with expanded input (case-insensitive)
-            if !path_lower.starts_with(&expanded_lower) {
-                continue;
-            }
-            
-            // Get remaining portion after the expanded input
-            let remaining = &path_str[expanded_str.len()..];
-            
-            // Find the last slash before the remaining content to get complete dir name
-            // e.g., if input is "~/r" -> expanded "/home/john/r"
-            // path is "/home/john/repos/..."
-            // remaining is "epos/..." (missing 'r')
-            // We need to find where the current directory starts in the full path
-            
-            // Instead, find the position right after expanded_str in the path
-            // and look backwards to find the start of that directory component
-            let search_pos = expanded_str.len();
-            let path_up_to_match = &path_str[..search_pos.min(path_str.len())];
-            
-            // Find the last slash in the matched portion to identify current dir start
-            let dir_start = path_up_to_match.rfind('/').map(|i| i + 1).unwrap_or(0);
-            let current_dir = &path_str[dir_start..];
-            
-            // Now find the end of this directory component
-            if let Some(slash_pos) = current_dir.find('/') {
-                let full_dir_name = &current_dir[..slash_pos];
-                if !full_dir_name.is_empty() {
-                    // Build the result path
-                    let parent_path = &path_str[..dir_start];
-                    let full_path = format!("{}{}/", parent_path, full_dir_name);
-                    
-                    // Convert to ~ format if needed
-                    let display_path = if input.starts_with("~/") {
-                        if let Some(ref home) = dirs::home_dir() {
-                            let home_str = home.to_string_lossy();
-                            if full_path.starts_with(home_str.as_ref()) {
-                                format!("~{}", &full_path[home_str.len()..])
-                            } else {
-                                full_path
-                            }
-                        } else {
-                            full_path
-                        }
-                    } else {
-                        full_path
-                    };
-                    seen.insert(display_path);
+        let Ok(entries) = fs::read_dir(parent) else {
+            return Vec::new();
+        };
+        let home = dirs::home_dir();
+        let preserve_tilde = input == "~" || input.starts_with("~/");
+        let mut results = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                if !name.to_lowercase().starts_with(&prefix_lower) {
+                    return None;
                 }
-            }
-        }
-        
-        let mut results: Vec<String> = seen.into_iter().collect();
-        results.sort();
+                let path = entry.path();
+                let mut display = if preserve_tilde {
+                    home.as_ref()
+                        .and_then(|home| path.strip_prefix(home).ok())
+                        .map(|relative| format!("~/{}", relative.display()))
+                        .unwrap_or_else(|| path.display().to_string())
+                } else {
+                    path.display().to_string()
+                };
+                display.push(std::path::MAIN_SEPARATOR);
+                Some(display)
+            })
+            .collect::<Vec<_>>();
+        results.sort_by_key(|value| value.to_lowercase());
+        results.truncate(20);
         results
     }
 
@@ -1763,6 +1838,81 @@ impl FerritorApp {
             });
     }
 
+    fn render_cut_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_cut_dialog {
+            return;
+        }
+
+        let yes = ctx.input(|i| !i.modifiers.ctrl && i.key_pressed(egui::Key::Y));
+        let no = ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || i.key_pressed(egui::Key::Enter)
+                || (!i.modifiers.ctrl && i.key_pressed(egui::Key::N))
+        });
+        let mut confirm = false;
+        let mut cancel = no;
+
+        egui::Window::new("Cut files")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let count = self.pending_cut_paths.len();
+                ui.label(if count == 1 {
+                    "Cut this item? It will be moved when you paste it.".to_string()
+                } else {
+                    format!("Cut these {count} items? They will be moved when you paste them.")
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("(Y)es").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("(N)o").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if yes || confirm {
+            let sources = std::mem::take(&mut self.pending_cut_paths);
+            self.close_cut_dialog();
+            self.apply_action(
+                ctx,
+                AppAction::SetFileClipboard {
+                    sources,
+                    is_cut: true,
+                },
+            );
+        } else if cancel {
+            self.close_cut_dialog();
+        }
+    }
+
+    fn render_file_action_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.file_action_confirmation.clone() else {
+            return;
+        };
+        let dismiss = ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || i.key_pressed(egui::Key::Enter)
+                || i.key_pressed(egui::Key::Space)
+        });
+        let mut clicked = false;
+        egui::Window::new("File action complete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(message);
+                ui.add_space(8.0);
+                clicked = ui.button("OK (Enter)").clicked();
+            });
+        if dismiss || clicked {
+            self.close_file_action_confirmation();
+        }
+    }
+
     fn open_terminal_here(&mut self) {
         match Command::new("kitty")
             .arg("--directory")
@@ -1814,6 +1964,10 @@ impl FerritorApp {
             OverlayState::Create
         } else if self.show_delete_dialog {
             OverlayState::Delete
+        } else if self.show_cut_dialog {
+            OverlayState::CutConfirm
+        } else if self.file_action_confirmation.is_some() {
+            OverlayState::FileAction
         } else if self.show_help {
             OverlayState::Help
         } else {
@@ -1869,6 +2023,17 @@ impl FerritorApp {
         self.exit_dialog_mode();
     }
 
+    fn close_cut_dialog(&mut self) {
+        self.show_cut_dialog = false;
+        self.pending_cut_paths.clear();
+        self.exit_dialog_mode();
+    }
+
+    fn close_file_action_confirmation(&mut self) {
+        self.file_action_confirmation = None;
+        self.exit_dialog_mode();
+    }
+
     fn close_dirty_nav(&mut self) {
         self.dirty_nav_target = None;
         self.exit_dialog_mode();
@@ -1907,6 +2072,9 @@ impl FerritorApp {
             ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::N));
         let ctrl_shift_n =
             ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::N));
+        let ctrl_c = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C));
+        let ctrl_x = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::X));
+        let ctrl_v = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::V));
         let key_e = ctx.input(|i| !i.modifiers.ctrl && i.key_pressed(egui::Key::E));
 
         // Table editing keybinds (Alt+R = add row, Alt+C = add column)
@@ -2028,7 +2196,10 @@ impl FerritorApp {
         // chain (delete confirm, dirty-nav). Dialogs with text inputs and
         // multiple buttons (open-dir, rename, create) let Tab cycle fields.
         let dialog_tab = if self.in_dialog() {
-            let no_input_dialog = self.show_delete_dialog || self.dirty_nav_target.is_some();
+            let no_input_dialog = self.show_delete_dialog
+                || self.show_cut_dialog
+                || self.file_action_confirmation.is_some()
+                || self.dirty_nav_target.is_some();
             let tab = if no_input_dialog {
                 ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
             } else {
@@ -2088,6 +2259,9 @@ impl FerritorApp {
             ctrl_r,
             ctrl_n,
             ctrl_shift_n,
+            ctrl_c,
+            ctrl_x,
+            ctrl_v,
             key_e,
             alt_r,
             alt_c,
@@ -2192,6 +2366,13 @@ impl FerritorApp {
                     self.enter_dialog_mode();
                 }
             }
+            AppAction::OpenCutDialog { sources } => {
+                if !sources.is_empty() {
+                    self.pending_cut_paths = sources;
+                    self.show_cut_dialog = true;
+                    self.enter_dialog_mode();
+                }
+            }
             AppAction::SetFileClipboard { sources, is_cut } => {
                 if !sources.is_empty() {
                     let verb = if is_cut { "Cut" } else { "Copied" };
@@ -2207,6 +2388,11 @@ impl FerritorApp {
                         .collect::<Vec<_>>()
                         .join("\n");
                     ctx.copy_text(paths_text);
+                    if !is_cut {
+                        let message = self.last_message.clone().unwrap_or_default();
+                        self.file_action_confirmation = Some(message);
+                        self.enter_dialog_mode();
+                    }
                 }
             }
             AppAction::PasteFileClipboard => {
@@ -2383,9 +2569,9 @@ impl FerritorApp {
         if kb_active && self.focus_pane == FocusPane::Files {
             // winit translates Ctrl+C/X/V into Event::Copy/Cut/Paste
             // rather than Event::Key, so we intercept those directly.
-            let mut file_copy = false;
-            let mut file_cut = false;
-            let mut file_paste = false;
+            let mut file_copy = intents.ctrl_c;
+            let mut file_cut = intents.ctrl_x;
+            let mut file_paste = intents.ctrl_v;
             ctx.input_mut(|input| {
                 input.events.retain(|event| match event {
                     egui::Event::Copy => {
@@ -2413,13 +2599,17 @@ impl FerritorApp {
                         .map(|r| vec![r.path.clone()])
                         .unwrap_or_default()
                 };
-                self.apply_action(
-                    ctx,
-                    AppAction::SetFileClipboard {
-                        sources,
-                        is_cut: file_cut,
-                    },
-                );
+                if file_cut {
+                    self.apply_action(ctx, AppAction::OpenCutDialog { sources });
+                } else {
+                    self.apply_action(
+                        ctx,
+                        AppAction::SetFileClipboard {
+                            sources,
+                            is_cut: false,
+                        },
+                    );
+                }
             }
             if file_paste {
                 self.apply_action(ctx, AppAction::PasteFileClipboard);
@@ -3414,6 +3604,8 @@ impl FerritorApp {
 
 impl eframe::App for FerritorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.refresh_theme_if_needed(ctx);
+
         let title = match self
             .selected_file
             .as_ref()
@@ -3553,6 +3745,8 @@ impl eframe::App for FerritorApp {
             self.render_rename_dialog(ctx);
             self.render_create_dialog(ctx);
             self.render_delete_dialog(ctx);
+            self.render_cut_dialog(ctx);
+            self.render_file_action_confirmation(ctx);
             return;
         }
 
@@ -3852,7 +4046,7 @@ impl eframe::App for FerritorApp {
                             ui.text_style_height(&egui::TextStyle::Monospace);
                         if self.editing {
                             let editor_id = egui::Id::new("viewer_editor");
-                            let highlighter = SyntaxHighlighter::get();
+                            let highlighter = &self.syntax_highlighter;
                             let path_for_layout = path.clone();
                             let mut layouter =
                                 move |ui: &egui::Ui,
@@ -3895,10 +4089,11 @@ impl eframe::App for FerritorApp {
                                     ui,
                                     &mut self.commonmark_cache,
                                     content,
+                                    self.heading_color,
                                 );
                             }
                         } else if let Some(content) = &self.loaded_content {
-                            let highlighter = SyntaxHighlighter::get();
+                            let highlighter = &self.syntax_highlighter;
                             let mut job = highlighter.highlight(content, &path);
                             if self.show_doc_find {
                                 if let Some(match_start) = self.doc_find_cursor_char {
@@ -3929,7 +4124,7 @@ impl eframe::App for FerritorApp {
                     // used by the raw text viewer and the final applied scroll offset.
                     if !self.editing && !(self.show_preview && self.selected_file_is_markdown()) {
                         if let Some(content) = &self.loaded_content {
-                            let highlighter = SyntaxHighlighter::get();
+                            let highlighter = &self.syntax_highlighter;
                             let job = highlighter.highlight(content, &path);
                             let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                             if let Some(target_char) = self.pending_viewer_scroll_char.take() {
@@ -4461,6 +4656,49 @@ fn split_table_cells(line: &str) -> Vec<String> {
 
 // --- Helpers ---
 
+fn apply_egui_visuals(ctx: &egui::Context, theme: &GtkTheme) {
+    let mut visuals = if theme.is_dark() {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.override_text_color = Some(theme.view_fg());
+    visuals.weak_text_color = Some(theme.muted_fg());
+    visuals.panel_fill = theme.view_bg();
+    visuals.window_fill = theme.dialog_bg();
+    visuals.window_stroke = egui::Stroke::new(1.0, theme.border());
+    visuals.extreme_bg_color = theme.view_bg();
+    visuals.faint_bg_color = theme.shade();
+    visuals.text_edit_bg_color = Some(theme.view_bg());
+    visuals.code_bg_color = theme.view_bg();
+    visuals.warn_fg_color = theme.warning();
+    visuals.error_fg_color = theme.error();
+    visuals.selection.bg_fill = theme.selection_bg();
+    visuals.selection.stroke = egui::Stroke::new(1.0, theme.selection_stroke());
+    visuals.widgets.noninteractive.bg_fill = theme.view_bg();
+    visuals.widgets.noninteractive.weak_bg_fill = theme.view_bg();
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.border());
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.view_fg());
+    visuals.widgets.inactive.bg_fill = theme.card_bg();
+    visuals.widgets.inactive.weak_bg_fill = theme.card_bg();
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme.border());
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.card_fg());
+    visuals.widgets.hovered.bg_fill = theme.hover_bg();
+    visuals.widgets.hovered.weak_bg_fill = theme.hover_bg();
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.accent());
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2, theme.view_fg());
+    visuals.widgets.active.bg_fill = theme.accent();
+    visuals.widgets.active.weak_bg_fill = theme.accent();
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme.accent());
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2, theme.accent_fg());
+    visuals.widgets.open.bg_fill = theme.popover_bg();
+    visuals.widgets.open.weak_bg_fill = theme.popover_bg();
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme.border());
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, theme.popover_fg());
+    visuals.text_cursor.stroke = egui::Stroke::new(2.0, theme.accent());
+    ctx.set_visuals(visuals);
+}
+
 fn shadcn_palette_from_gtk(theme: &GtkTheme) -> ColorPalette {
     let mut palette = if theme.is_dark() {
         ColorPalette::dark()
@@ -4538,6 +4776,39 @@ fn unique_path(path: PathBuf) -> PathBuf {
         }
     }
     path
+}
+
+fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else {
+        fs::copy(src, dst).map(|_| ())
+    }
+}
+
+fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+
+    // rename can fail across filesystems. Copy first, then remove the source;
+    // if removal fails, roll back the newly-created destination so "move"
+    // never silently becomes a duplicate.
+    copy_path(src, dst)?;
+    let remove_result = if src.is_dir() {
+        fs::remove_dir_all(src)
+    } else {
+        fs::remove_file(src)
+    };
+    if let Err(error) = remove_result {
+        let _ = if dst.is_dir() {
+            fs::remove_dir_all(dst)
+        } else {
+            fs::remove_file(dst)
+        };
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {

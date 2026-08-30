@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct GtkTheme {
@@ -7,20 +7,26 @@ pub struct GtkTheme {
 }
 
 impl GtkTheme {
-    pub fn load() -> Self {
-        let path = dirs::config_dir()
+    pub fn source_path() -> PathBuf {
+        dirs::config_dir()
             .unwrap_or_default()
             .join("gtk-4.0")
-            .join("gtk.css");
-        Self::from_file(&path)
+            .join("gtk.css")
     }
 
-    fn from_file(path: &Path) -> Self {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return Self {
-                colors: HashMap::new(),
-            };
-        };
+    pub fn load() -> Self {
+        Self::try_load().unwrap_or_else(|| Self {
+            colors: HashMap::new(),
+        })
+    }
+
+    pub fn try_load() -> Option<Self> {
+        let theme = Self::from_file(&Self::source_path())?;
+        (!theme.colors.is_empty()).then_some(theme)
+    }
+
+    fn from_file(path: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
 
         let mut defs = HashMap::<String, String>::new();
         for line in content.lines() {
@@ -36,7 +42,7 @@ impl GtkTheme {
             let _ = resolve_named_color(&key, &defs, &mut colors, &mut resolving);
         }
 
-        Self { colors }
+        Some(Self { colors })
     }
 
     pub fn is_dark(&self) -> bool {
@@ -190,6 +196,17 @@ impl GtkTheme {
 
     pub fn palette(&self, name: &str, level: u8) -> Option<egui::Color32> {
         self.get_opt(&format!("{}_{}", name, level))
+    }
+
+    /// Pick Ferritor's heading foreground from the colors supplied by the
+    /// active GTK theme. The incoming pairings are not trusted: candidates
+    /// must remain readable on both the view and its selection overlay.
+    pub fn heading_fg(&self) -> egui::Color32 {
+        let surfaces = [
+            self.view_bg(),
+            alpha_blend(self.view_bg(), self.selection_bg()),
+        ];
+        choose_palette_text_color(self.accent(), &surfaces, self.colors.values().copied())
     }
 
     fn get_opt(&self, name: &str) -> Option<egui::Color32> {
@@ -357,4 +374,91 @@ fn luminance(color: egui::Color32) -> f32 {
         }
     }
     0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+}
+
+fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+    let (lighter, darker) = if luminance(a) >= luminance(b) {
+        (luminance(a), luminance(b))
+    } else {
+        (luminance(b), luminance(a))
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn color_distance_sq(a: egui::Color32, b: egui::Color32) -> u32 {
+    let dr = i32::from(a.r()) - i32::from(b.r());
+    let dg = i32::from(a.g()) - i32::from(b.g());
+    let db = i32::from(a.b()) - i32::from(b.b());
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+fn choose_palette_text_color(
+    preferred: egui::Color32,
+    surfaces: &[egui::Color32],
+    colors: impl IntoIterator<Item = egui::Color32>,
+) -> egui::Color32 {
+    const MIN_CONTRAST: f32 = 4.5;
+
+    let mut candidates = Vec::new();
+    for color in colors {
+        if color.a() == 255 && !candidates.contains(&color) {
+            candidates.push(color);
+        }
+    }
+    if candidates.is_empty() {
+        return preferred;
+    }
+
+    let min_contrast = |color| {
+        surfaces
+            .iter()
+            .map(|surface| contrast_ratio(color, *surface))
+            .fold(f32::INFINITY, f32::min)
+    };
+
+    candidates
+        .iter()
+        .copied()
+        .filter(|color| min_contrast(*color) >= MIN_CONTRAST)
+        .min_by_key(|color| color_distance_sq(*color, preferred))
+        .unwrap_or_else(|| {
+            candidates
+                .into_iter()
+                .max_by(|a, b| min_contrast(*a).total_cmp(&min_contrast(*b)))
+                .unwrap_or(preferred)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_color_moves_to_nearest_passing_palette_color() {
+        let background = egui::Color32::from_rgb(0xff, 0xfb, 0xef);
+        let accent = egui::Color32::from_rgb(0x3a, 0x94, 0xc5);
+        let darker_blue = egui::Color32::from_rgb(0x1c, 0x71, 0xd8);
+        let unrelated_dark = egui::Color32::from_rgb(0x2e, 0x38, 0x3c);
+
+        let chosen =
+            choose_palette_text_color(accent, &[background], [accent, darker_blue, unrelated_dark]);
+
+        assert_eq!(chosen, darker_blue);
+        assert!(contrast_ratio(chosen, background) >= 4.5);
+    }
+
+    #[test]
+    fn heading_color_uses_strongest_palette_fallback() {
+        let background = egui::Color32::from_rgb(0x80, 0x80, 0x80);
+        let preferred = egui::Color32::from_rgb(0x90, 0x90, 0x90);
+        let stronger = egui::Color32::from_rgb(0x10, 0x10, 0x10);
+
+        let chosen = choose_palette_text_color(
+            preferred,
+            &[background, egui::Color32::from_rgb(0x70, 0x70, 0x70)],
+            [preferred, stronger],
+        );
+
+        assert_eq!(chosen, stronger);
+    }
 }

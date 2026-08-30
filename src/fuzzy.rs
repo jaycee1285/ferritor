@@ -288,18 +288,6 @@ impl FuzzySearch {
         &self.results
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn candidates(&self) -> &[PathBuf] {
-        &self.candidates
-    }
-
-    pub fn labels(&self) -> &[String] {
-        &self.labels
-    }
-
     pub fn move_cursor_up(&mut self){
         self.cursor = self.cursor.saturating_sub(1);
     }

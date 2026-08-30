@@ -1318,6 +1318,7 @@ dependencies = [
 name = "ferritor"
 version = "0.1.0"
 dependencies = [
+ "accesskit_atspi_common",
  "dirs",
  "eframe",
  "egui",

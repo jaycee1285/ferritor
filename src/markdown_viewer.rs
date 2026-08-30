@@ -11,13 +11,36 @@
 
 use egui::{self, Color32, FontFamily, FontId, TextStyle};
 use egui_commonmark::CommonMarkCache;
-use pulldown_cmark::{Event, Parser};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-pub fn show_with_tables(ui: &mut egui::Ui, cache: &mut CommonMarkCache, markdown: &str) {
+pub fn show_with_tables(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    markdown: &str,
+    heading_color: Color32,
+) {
+    ui.scope(|ui| {
+        // egui_commonmark renders headings and **strong text** via
+        // RichText::strong(). In egui, strong text ignores
+        // override_text_color and instead reads widgets.active.fg_stroke.
+        // Override that channel only for the preview so the WCAG-selected
+        // heading color reaches the final galley without changing buttons
+        // elsewhere in Ferritor.
+        ui.visuals_mut().widgets.active.fg_stroke.color = heading_color;
+        show_with_tables_inner(ui, cache, markdown, heading_color);
+    });
+}
+
+fn show_with_tables_inner(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    markdown: &str,
+    heading_color: Color32,
+) {
     let table_regions = find_table_regions(markdown);
 
     if table_regions.is_empty() {
-        egui_commonmark::CommonMarkViewer::new().show(ui, cache, markdown);
+        show_with_heading_color(ui, cache, markdown, heading_color);
         return;
     }
 
@@ -25,13 +48,13 @@ pub fn show_with_tables(ui: &mut egui::Ui, cache: &mut CommonMarkCache, markdown
     for (start, end, table_md) in &table_regions {
         if *start > last_end {
             let before = &markdown[last_end..*start];
-            egui_commonmark::CommonMarkViewer::new().show(ui, cache, before);
+            show_with_heading_color(ui, cache, before, heading_color);
         }
 
         if let Some(table) = parse_extended_table(table_md) {
             render_extended_table(ui, &table);
         } else {
-            egui_commonmark::CommonMarkViewer::new().show(ui, cache, table_md);
+            show_with_heading_color(ui, cache, table_md, heading_color);
         }
 
         last_end = *end;
@@ -39,8 +62,56 @@ pub fn show_with_tables(ui: &mut egui::Ui, cache: &mut CommonMarkCache, markdown
 
     if last_end < markdown.len() {
         let after = &markdown[last_end..];
-        egui_commonmark::CommonMarkViewer::new().show(ui, cache, after);
+        show_with_heading_color(ui, cache, after, heading_color);
     }
+}
+
+fn show_with_heading_color(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    markdown: &str,
+    heading_color: Color32,
+) {
+    let heading_regions = find_heading_regions(markdown);
+    if heading_regions.is_empty() {
+        egui_commonmark::CommonMarkViewer::new().show(ui, cache, markdown);
+        return;
+    }
+
+    let mut last_end = 0;
+    for (start, end) in heading_regions {
+        if start > last_end {
+            egui_commonmark::CommonMarkViewer::new().show(ui, cache, &markdown[last_end..start]);
+        }
+        ui.scope(|ui| {
+            ui.visuals_mut().override_text_color = Some(heading_color);
+            egui_commonmark::CommonMarkViewer::new().show(ui, cache, &markdown[start..end]);
+        });
+        last_end = end;
+    }
+
+    if last_end < markdown.len() {
+        egui_commonmark::CommonMarkViewer::new().show(ui, cache, &markdown[last_end..]);
+    }
+}
+
+fn find_heading_regions(markdown: &str) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut heading_start = None;
+
+    for (event, range) in Parser::new(markdown).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { .. }) => heading_start = Some(range.start),
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(start) = heading_start.take() {
+                    regions.push((start, range.end));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    regions
 }
 
 // ============= TABLE DETECTION =============
@@ -724,6 +795,83 @@ fn calculate_column_widths(available_width: f32, table: &ExtTable) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_text_color(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Color32> {
+        fn visit(shape: &egui::Shape, needle: &str) -> Option<Color32> {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let job = &text.galley.job;
+                    job.sections.iter().find_map(|section| {
+                        let section_text = &job.text[section.byte_range.clone()];
+                        section_text.contains(needle).then_some(
+                            text.override_text_color
+                                .unwrap_or(section.format.color),
+                        )
+                    })
+                }
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| visit(shape, needle))
+                }
+                _ => None,
+            }
+        }
+
+        shapes
+            .iter()
+            .find_map(|clipped| visit(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn preview_heading_and_strong_text_use_wcag_color() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| {
+            style.visuals.override_text_color = Some(Color32::BLACK);
+            // Reproduce a light GTK theme whose accent foreground is white.
+            style.visuals.widgets.active.fg_stroke.color = Color32::WHITE;
+        });
+        let expected = Color32::from_rgb(0x1c, 0x71, 0xd8);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut cache = CommonMarkCache::default();
+                show_with_tables(
+                    ui,
+                    &mut cache,
+                    "# Preview heading\n\nBody with **bold words**.",
+                    expected,
+                );
+            });
+        });
+
+        assert_eq!(
+            rendered_text_color(&output.shapes, "Preview heading"),
+            Some(expected)
+        );
+        assert_eq!(
+            rendered_text_color(&output.shapes, "bold words"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn heading_regions_include_atx_and_setext_headings() {
+        let md = "# First\n\nBody\n\nSecond\n------\n\nLast";
+        let regions = find_heading_regions(md);
+        let headings: Vec<&str> = regions
+            .iter()
+            .map(|(start, end)| &md[*start..*end])
+            .collect();
+
+        assert_eq!(headings, vec!["# First\n", "Second\n------\n"]);
+    }
+
+    #[test]
+    fn heading_regions_ignore_heading_markers_in_code() {
+        let md = "```md\n# Not a heading\n```\n\n## Real heading";
+        let regions = find_heading_regions(md);
+
+        assert_eq!(regions.len(), 1);
+        assert_eq!(&md[regions[0].0..regions[0].1], "## Real heading");
+    }
 
     #[test]
     fn test_split_row_basic() {

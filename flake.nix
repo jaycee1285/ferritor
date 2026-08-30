@@ -9,7 +9,8 @@
 
   inputs = {
     config.url = "github:jaycee1285/config";
-    nixpkgs.follows = "config/nixpkgs";
+	nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+#    nixpkgs.follows = "config/nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -50,19 +51,20 @@
         };
 
         packages.default = rustPlatform.buildRustPackage {
-          pname = "ferritor";
-          version = "0.1.0";
-          src = cleanSrc;
-          cargoLock.lockFile = ./Cargo.lock;
+  pname = "ferritor";
+  version = "0.1.0";
+  src = cleanSrc;
 
-          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
-          buildInputs = nativeDeps;
+  cargoHash = "sha256-OdTqNKxZtA39r5cQYKFAvW9P+Fv/LE2racTH1MCnH9c=";
 
-          postFixup = ''
-            wrapProgram $out/bin/ferritor \
-              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath nativeDeps}
-          '';
-        };
+  nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
+  buildInputs = nativeDeps;
+
+  postFixup = ''
+    wrapProgram $out/bin/ferritor \
+      --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath nativeDeps}
+  '';
+};
 
         apps.default = flake-utils.lib.mkApp {
           drv = self.packages.${system}.default;
