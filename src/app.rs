@@ -9,7 +9,10 @@ use egui_shadcn::{
     CardVariant, ColorPalette, TableCellProps, TableProps, TableRowProps, TableVariant, Theme,
 };
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,6 +23,7 @@ const UNDO_GROUP_SIZE: usize = 20;
 const UNDO_MAX_DEPTH: usize = 5;
 const RECENTS_CAP: usize = 5;
 const THEME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
@@ -176,8 +180,16 @@ enum OverlayState {
     Delete,
     CutConfirm,
     FileAction,
+    Conflict,
     DirtyNav,
     Help,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SaveOutcome {
+    Done,
+    Conflict,
+    Failed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -242,6 +254,8 @@ enum AppAction {
         target: DirtyNavTarget,
     },
     DirtyDialogCancelToEditor,
+    ConflictKeepMine,
+    ConflictLoadDisk,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -365,6 +379,8 @@ pub struct FerritorApp {
     theme_fingerprint: ThemeFingerprint,
     pending_theme_fingerprint: Option<ThemeFingerprint>,
     last_theme_check: Instant,
+    selected_file_fingerprint: Option<FileFingerprint>,
+    last_file_check: Instant,
     current_dir: PathBuf,
     selected_file: Option<PathBuf>,
     loaded_content: Option<String>,
@@ -389,6 +405,8 @@ pub struct FerritorApp {
     edit_buffer: String,
     original_content: Option<String>,
     dirty_nav_target: Option<DirtyNavTarget>,
+    save_conflict: bool,
+    conflict_focus: u8,
     viewer_scroll_delta: f32,
     viewer_scroll_y: f32,
     viewer_line_height_px: f32,
@@ -498,6 +516,8 @@ impl FerritorApp {
             theme_fingerprint,
             pending_theme_fingerprint: None,
             last_theme_check: Instant::now(),
+            selected_file_fingerprint: None,
+            last_file_check: Instant::now(),
             current_dir: current_dir.clone(),
             selected_file: None,
             loaded_content: None,
@@ -522,6 +542,8 @@ impl FerritorApp {
             edit_buffer: String::new(),
             original_content: None,
             dirty_nav_target: None,
+            save_conflict: false,
+            conflict_focus: 0,
             viewer_scroll_delta: 0.0,
             viewer_scroll_y: 0.0,
             viewer_line_height_px: 18.0,
@@ -619,6 +641,37 @@ impl FerritorApp {
         self.theme_fingerprint = fingerprint;
         self.pending_theme_fingerprint = None;
         ctx.request_repaint();
+    }
+
+    fn refresh_selected_file_if_needed(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(FILE_POLL_INTERVAL);
+        if self.editing || self.last_file_check.elapsed() < FILE_POLL_INTERVAL {
+            return;
+        }
+        self.last_file_check = Instant::now();
+
+        let Some(path) = self.selected_file.clone() else {
+            self.selected_file_fingerprint = None;
+            return;
+        };
+        let fingerprint = FileFingerprint::capture(Some(path.clone()));
+        if fingerprint == self.selected_file_fingerprint && self.load_error.is_none() {
+            return;
+        }
+
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                self.loaded_content = Some(content.clone());
+                self.original_content = Some(content);
+                self.load_error = None;
+                self.selected_file_fingerprint = fingerprint;
+            }
+            Err(err) => {
+                // Keep the last good contents and retry. Atomic replacements can
+                // briefly make a path unreadable on some network filesystems.
+                self.load_error = Some(format!("Cannot refresh as UTF-8 text: {err}"));
+            }
+        }
     }
 
     // --- Tree building ---
@@ -768,7 +821,7 @@ impl FerritorApp {
             dirs: self.recent_dirs.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
-            let _ = fs::write(path, json);
+            let _ = write_atomic(&path, &json);
         }
     }
 
@@ -805,10 +858,14 @@ impl FerritorApp {
                 };
                 if path.is_file() {
                     self.close_recents_dialog();
-                    if let Some(parent) = path.parent() {
-                        self.open_directory(parent.to_path_buf());
+                    if self.is_dirty() {
+                        self.set_dirty_nav(DirtyNavTarget::OpenSearchResult(path));
+                    } else {
+                        if let Some(parent) = path.parent() {
+                            self.open_directory(parent.to_path_buf());
+                        }
+                        self.open_file(path);
                     }
-                    self.open_file(path);
                 } else {
                     self.recent_files.retain(|p| p.is_file());
                     self.recents_cursor = 0;
@@ -821,7 +878,11 @@ impl FerritorApp {
                 };
                 if path.is_dir() {
                     self.close_recents_dialog();
-                    self.open_directory(path);
+                    if self.is_dirty() {
+                        self.set_dirty_nav(DirtyNavTarget::EnterDirectory(path));
+                    } else {
+                        self.open_directory(path);
+                    }
                 } else {
                     self.recent_dirs.retain(|p| p.is_dir());
                     self.recents_cursor = 0;
@@ -877,15 +938,24 @@ impl FerritorApp {
         }
     }
 
-    fn exit_edit_mode(&mut self, save: bool) {
+    #[must_use]
+    fn exit_edit_mode(&mut self, save: bool) -> SaveOutcome {
         if save && self.is_dirty() {
             // Push final snapshot before saving
             self.undo_history.push_snapshot(&self.edit_buffer);
             if let Some(path) = self.selected_file.clone() {
-                match fs::write(&path, &self.edit_buffer) {
+                if file_contents_changed(&path, &self.original_content) {
+                    self.save_conflict = true;
+                    self.conflict_focus = 0;
+                    self.enter_dialog_mode();
+                    return SaveOutcome::Conflict;
+                }
+                match write_atomic(&path, &self.edit_buffer) {
                     Ok(()) => {
                         self.loaded_content = Some(self.edit_buffer.clone());
                         self.original_content = Some(self.edit_buffer.clone());
+                        self.selected_file_fingerprint =
+                            FileFingerprint::capture(Some(path.clone()));
                         let file_name = path
                             .file_name()
                             .and_then(|name| name.to_str())
@@ -894,8 +964,12 @@ impl FerritorApp {
                     }
                     Err(err) => {
                         self.last_message = Some(format!("Save error: {}", err));
+                        return SaveOutcome::Failed;
                     }
                 }
+            } else {
+                self.last_message = Some("Save error: no file is open".to_string());
+                return SaveOutcome::Failed;
             }
         } else if !save {
             self.loaded_content = self.original_content.clone();
@@ -903,16 +977,25 @@ impl FerritorApp {
 
         self.editing = false;
         self.edit_buffer.clear();
+        self.save_conflict = false;
+        SaveOutcome::Done
     }
 
     fn open_directory(&mut self, path: PathBuf) {
+        if !path.is_dir() {
+            self.last_message = Some(format!("Cannot open directory: {}", path.display()));
+            return;
+        }
         self.current_dir = path;
         self.selected_file = None;
+        self.selected_file_fingerprint = None;
         self.loaded_content = None;
         self.load_error = None;
         self.editing = false;
         self.edit_buffer.clear();
         self.original_content = None;
+        self.save_conflict = false;
+        self.dirty_nav_target = None;
         self.show_doc_find = false;
         self.doc_find_cursor_char = None;
         self.pending_viewer_scroll_char = None;
@@ -950,12 +1033,15 @@ impl FerritorApp {
                 self.loaded_content = Some(content.clone());
                 self.original_content = Some(content);
                 self.focus_pane = FocusPane::Viewer;
+                self.selected_file_fingerprint =
+                    FileFingerprint::capture(Some(path.clone()));
             }
             Err(err) => {
                 self.loaded_content = None;
                 self.original_content = None;
                 self.load_error = Some(format!("Cannot open as UTF-8 text: {}", err));
                 self.focus_pane = FocusPane::Viewer;
+                self.selected_file_fingerprint = None;
             }
         }
 
@@ -964,11 +1050,14 @@ impl FerritorApp {
 
     fn close_file(&mut self) {
         self.selected_file = None;
+        self.selected_file_fingerprint = None;
         self.loaded_content = None;
         self.load_error = None;
         self.editing = false;
         self.edit_buffer.clear();
         self.original_content = None;
+        self.save_conflict = false;
+        self.dirty_nav_target = None;
         self.show_preview = false;
         self.show_doc_find = false;
         self.doc_find_cursor_char = None;
@@ -992,6 +1081,39 @@ impl FerritorApp {
             };
             self.pending_editor_cursor_char = Some(anchor_char);
             self.undo_history.begin(&content);
+        }
+    }
+
+    fn show_editor(&mut self, ui: &mut egui::Ui, path: &Path) {
+        self.viewer_line_height_px = ui.text_style_height(&egui::TextStyle::Monospace);
+        let editor_id = egui::Id::new("viewer_editor");
+        let highlighter = &self.syntax_highlighter;
+        let path_for_layout = path.to_path_buf();
+        let mut layouter =
+            move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                let mut job = highlighter.highlight(text.as_str(), &path_for_layout);
+                job.wrap.max_width = wrap_width;
+                ui.fonts_mut(|fonts| fonts.layout_job(job))
+            };
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut self.edit_buffer)
+                .id(editor_id)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .code_editor()
+                .layouter(&mut layouter),
+        );
+        if self.editor_wants_focus {
+            response.request_focus();
+            if let Some(cursor_char) = self.pending_editor_cursor_char.take() {
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), editor_id) {
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(cursor_char),
+                    )));
+                    state.store(ui.ctx(), editor_id);
+                }
+            }
+            self.editor_wants_focus = false;
         }
     }
 
@@ -1034,8 +1156,8 @@ impl FerritorApp {
 
     fn rename_path(&mut self, new_name: &str) {
         let new_name = new_name.trim();
-        if new_name.is_empty() {
-            self.last_message = Some("Rename cancelled: empty name".to_string());
+        if !valid_name(new_name) {
+            self.last_message = Some("Rename failed: invalid name".to_string());
             return;
         }
 
@@ -1044,25 +1166,25 @@ impl FerritorApp {
             if new_path == old_path {
                 return;
             }
-            if new_path.exists() {
+            if path_is_taken(&new_path) {
                 self.last_message = Some(format!("Rename failed: '{}' already exists", new_name));
                 self.close_rename_dialog();
                 return;
             }
             match fs::rename(&old_path, &new_path) {
                 Ok(()) => {
-                    // Update selected_file if it was the renamed item
-                    if self.selected_file.as_ref() == Some(&old_path) {
-                        self.selected_file = Some(new_path.clone());
+                    if let Some(open_file) = self.selected_file.clone() {
+                        if let Ok(relative) = open_file.strip_prefix(&old_path) {
+                            self.selected_file = Some(new_path.join(relative));
+                        }
                     }
-                    // Update expanded_dirs
-                    if self.expanded_dirs.remove(&old_path) {
-                        self.expanded_dirs.insert(new_path.clone());
-                    }
-                    // Update multi-selection
-                    if self.selected_paths.remove(&old_path) {
-                        self.selected_paths.insert(new_path.clone());
-                    }
+                    self.expanded_dirs = rewrite_path_set(&self.expanded_dirs, &old_path, &new_path);
+                    self.selected_paths = rewrite_path_set(&self.selected_paths, &old_path, &new_path);
+                    rewrite_paths(&mut self.clipboard_paths, &old_path, &new_path);
+                    rewrite_paths(&mut self.recent_files, &old_path, &new_path);
+                    rewrite_paths(&mut self.recent_dirs, &old_path, &new_path);
+                    self.save_recents_to_disk();
+                    self.fuzzy_search.invalidate();
                     self.last_message = Some(format!("Renamed to '{}'", new_name));
                     self.refresh_nav_rows();
                 }
@@ -1075,19 +1197,19 @@ impl FerritorApp {
 
     fn execute_create(&mut self, name: &str) {
         let name = name.trim();
-        if name.is_empty() {
-            self.last_message = Some("Create cancelled: empty name".to_string());
+        if !valid_name(name) {
+            self.last_message = Some("Create failed: invalid name".to_string());
             return;
         }
         let target = self.create_target_dir.join(name);
-        if target.exists() {
-            self.last_message = Some(format!("'{}' already exists", name));
-            return;
-        }
         let result = if self.create_is_dir {
             fs::create_dir(&target)
         } else {
-            fs::write(&target, "")
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map(|_| ())
         };
         match result {
             Ok(()) => {
@@ -1097,6 +1219,7 @@ impl FerritorApp {
                     "file"
                 };
                 self.last_message = Some(format!("Created {} '{}'", kind, name));
+                self.fuzzy_search.invalidate();
                 // Ensure the parent dir is expanded so the new item is visible
                 if self.create_target_dir != self.current_dir {
                     self.expanded_dirs.insert(self.create_target_dir.clone());
@@ -1109,7 +1232,11 @@ impl FerritorApp {
                 }
             }
             Err(err) => {
-                self.last_message = Some(format!("Create error: {}", err));
+                self.last_message = if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    Some(format!("'{}' already exists", name))
+                } else {
+                    Some(format!("Create error: {}", err))
+                };
             }
         }
     }
@@ -1117,6 +1244,7 @@ impl FerritorApp {
     fn execute_delete(&mut self) {
         let targets: Vec<PathBuf> = self.delete_targets.drain(..).collect();
         let mut deleted = 0;
+        let mut failed = Vec::new();
         let mut should_close_file = false;
         for target in &targets {
             let result = if target.is_dir() {
@@ -1124,19 +1252,34 @@ impl FerritorApp {
             } else {
                 fs::remove_file(target)
             };
-            if result.is_ok() {
-                deleted += 1;
-                if self.selected_file.as_ref() == Some(target) {
-                    should_close_file = true;
+            match result {
+                Ok(()) => {
+                    deleted += 1;
+                    if self
+                        .selected_file
+                        .as_ref()
+                        .is_some_and(|open_file| open_file.starts_with(target))
+                    {
+                        should_close_file = true;
+                    }
+                    self.expanded_dirs.retain(|p| !p.starts_with(target));
+                    self.selected_paths.remove(target);
                 }
-                self.expanded_dirs.retain(|p| !p.starts_with(target));
-                self.selected_paths.remove(target);
+                Err(err) => failed.push((target.clone(), err)),
             }
         }
         if should_close_file {
             self.close_file();
         }
         if deleted > 0 {
+            self.fuzzy_search.invalidate();
+        }
+        if let Some((path, err)) = failed.first() {
+            self.last_message = Some(format!(
+                "Deleted {deleted} item(s); failed to delete {}: {err}",
+                path.display()
+            ));
+        } else if deleted > 0 {
             let label = if deleted == 1 {
                 "Deleted 1 item".to_string()
             } else {
@@ -1214,6 +1357,7 @@ impl FerritorApp {
         }
 
         if !completed.is_empty() {
+            self.fuzzy_search.invalidate();
             if target_dir != self.current_dir {
                 self.expanded_dirs.insert(target_dir);
             }
@@ -1260,7 +1404,11 @@ impl FerritorApp {
         match self.try_pick_directory_with_zenity() {
             Ok(Some(path)) => {
                 self.close_open_dir_dialog();
-                self.open_directory(path);
+                if self.is_dirty() {
+                    self.set_dirty_nav(DirtyNavTarget::EnterDirectory(path));
+                } else {
+                    self.open_directory(path);
+                }
                 self.last_message = Some("Opened directory via native picker".to_string());
             }
             Ok(None) => {
@@ -1380,12 +1528,16 @@ impl FerritorApp {
                 .filter(|entry| entry.is_dir())
                 .map(|entry| entry.to_path_buf())
             {
-                self.open_directory(path);
-                self.last_message =
-                    Some("Opened directory from picker selection (Ctrl+Enter)".to_string());
                 self.open_dir_file_dialog =
                     Self::build_open_dir_file_dialog(self.current_dir.clone());
                 self.exit_dialog_mode();
+                if self.is_dirty() {
+                    self.set_dirty_nav(DirtyNavTarget::EnterDirectory(path));
+                } else {
+                    self.open_directory(path);
+                }
+                self.last_message =
+                    Some("Opened directory from picker selection (Ctrl+Enter)".to_string());
                 return;
             }
             self.last_message = Some("Ctrl+Enter: highlight a directory first".to_string());
@@ -1396,11 +1548,18 @@ impl FerritorApp {
         }
         if let Some(path) = self.open_dir_file_dialog.take_picked() {
             if path.is_dir() {
-                self.open_directory(path);
+                self.open_dir_file_dialog =
+                    Self::build_open_dir_file_dialog(self.current_dir.clone());
+                self.exit_dialog_mode();
+                if self.is_dirty() {
+                    self.set_dirty_nav(DirtyNavTarget::EnterDirectory(path));
+                } else {
+                    self.open_directory(path);
+                }
             } else {
                 self.last_message = Some("Selected path is not a directory".to_string());
+                self.exit_dialog_mode();
             }
-            self.exit_dialog_mode();
             return;
         }
 
@@ -1573,8 +1732,12 @@ impl FerritorApp {
             let path = Self::expand_user_path(&self.open_dir_input);
             if path.is_dir() {
                 debug_notify("Dialog", &format!("Open Dir: opening {}", path.display()));
-                self.open_directory(path);
                 self.close_open_dir_dialog();
+                if self.is_dirty() {
+                    self.set_dirty_nav(DirtyNavTarget::EnterDirectory(path));
+                } else {
+                    self.open_directory(path);
+                }
                 return;
             }
             self.last_message = Some(format!(
@@ -1788,7 +1951,7 @@ impl FerritorApp {
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
 
         let accent = self.theme.accent();
-        let focus_stroke = egui::Stroke::new(2.0, accent);
+        let focus_stroke = egui::Stroke::new(2.0_f32, accent);
 
         egui::Window::new("Delete")
             .collapsible(false)
@@ -1950,7 +2113,9 @@ impl FerritorApp {
     }
 
     fn overlay_state(&self) -> OverlayState {
-        if self.dirty_nav_target.is_some() {
+        if self.save_conflict {
+            OverlayState::Conflict
+        } else if self.dirty_nav_target.is_some() {
             OverlayState::DirtyNav
         } else if self.show_fuzzy_dialog {
             OverlayState::Fuzzy
@@ -2037,6 +2202,23 @@ impl FerritorApp {
     fn close_dirty_nav(&mut self) {
         self.dirty_nav_target = None;
         self.exit_dialog_mode();
+    }
+
+    fn finish_save_dialog(&mut self, ctx: &egui::Context) {
+        let target = self.dirty_nav_target.take();
+        self.save_conflict = false;
+        self.exit_dialog_mode();
+        if let Some(target) = target {
+            self.apply_dirty_nav(ctx, &target);
+        }
+    }
+
+    fn return_to_editor_after_save_failure(&mut self) {
+        self.dirty_nav_target = None;
+        self.save_conflict = false;
+        self.exit_dialog_mode();
+        self.focus_pane = FocusPane::Viewer;
+        self.editor_wants_focus = true;
     }
 
     fn collect_intents(
@@ -2199,6 +2381,7 @@ impl FerritorApp {
             let no_input_dialog = self.show_delete_dialog
                 || self.show_cut_dialog
                 || self.file_action_confirmation.is_some()
+                || self.save_conflict
                 || self.dirty_nav_target.is_some();
             let tab = if no_input_dialog {
                 ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
@@ -2403,28 +2586,72 @@ impl FerritorApp {
             AppAction::EnterEditMode => self.enter_edit_mode(),
             AppAction::SaveAndExitEditMode => {
                 debug_notify("Keybind", "Ctrl+S: editor save");
-                self.undo_history.push_snapshot(&self.edit_buffer);
-                self.exit_edit_mode(true);
+                let _ = self.exit_edit_mode(true);
             }
-            AppAction::ExitEditModeDiscard => self.exit_edit_mode(false),
+            AppAction::ExitEditModeDiscard => {
+                let _ = self.exit_edit_mode(false);
+            }
             AppAction::SetFocusPane(pane) => self.focus_pane = pane,
             AppAction::DirtyDialogSaveAndApply { target } => {
                 debug_notify("Dialog", "Dirty: Save");
-                self.exit_edit_mode(true);
-                self.apply_dirty_nav(ctx, &target);
-                self.close_dirty_nav();
+                match self.exit_edit_mode(true) {
+                    SaveOutcome::Done => {
+                        self.dirty_nav_target = None;
+                        self.exit_dialog_mode();
+                        self.apply_dirty_nav(ctx, &target);
+                    }
+                    SaveOutcome::Conflict => {}
+                    SaveOutcome::Failed => self.return_to_editor_after_save_failure(),
+                }
             }
             AppAction::DirtyDialogDiscardAndApply { target } => {
                 debug_notify("Dialog", "Dirty: Discard");
-                self.exit_edit_mode(false);
+                let _ = self.exit_edit_mode(false);
+                self.dirty_nav_target = None;
+                self.exit_dialog_mode();
                 self.apply_dirty_nav(ctx, &target);
-                self.close_dirty_nav();
             }
             AppAction::DirtyDialogCancelToEditor => {
                 debug_notify("Dialog", "Dirty: Cancel → back to editing");
                 self.close_dirty_nav();
                 self.focus_pane = FocusPane::Viewer;
                 self.editor_wants_focus = true;
+            }
+            AppAction::ConflictKeepMine => {
+                let Some(path) = self.selected_file.clone() else {
+                    self.last_message = Some("Save error: no file is open".to_string());
+                    self.return_to_editor_after_save_failure();
+                    return;
+                };
+                self.original_content = fs::read_to_string(&path).ok();
+                self.save_conflict = false;
+                match self.exit_edit_mode(true) {
+                    SaveOutcome::Done => self.finish_save_dialog(ctx),
+                    SaveOutcome::Conflict => {}
+                    SaveOutcome::Failed => self.return_to_editor_after_save_failure(),
+                }
+            }
+            AppAction::ConflictLoadDisk => {
+                let Some(path) = self.selected_file.clone() else {
+                    self.last_message = Some("Reload error: no file is open".to_string());
+                    return;
+                };
+                match fs::read_to_string(&path) {
+                    Ok(content) => {
+                        self.loaded_content = Some(content.clone());
+                        self.original_content = Some(content);
+                        self.editing = false;
+                        self.edit_buffer.clear();
+                        self.load_error = None;
+                        self.selected_file_fingerprint =
+                            FileFingerprint::capture(Some(path));
+                        self.last_message = Some("Loaded the version on disk".to_string());
+                        self.finish_save_dialog(ctx);
+                    }
+                    Err(err) => {
+                        self.last_message = Some(format!("Reload error: {err}"));
+                    }
+                }
             }
         }
     }
@@ -2500,7 +2727,7 @@ impl FerritorApp {
         if intents.ctrl_t && kb_active {
             self.apply_action(ctx, AppAction::OpenTerminalHere);
         }
-        if intents.ctrl_p && kb_active && !self.editing && self.selected_file_is_markdown() {
+        if intents.ctrl_p && self.selected_file_is_markdown() && !overlay_active {
             self.apply_action(ctx, AppAction::TogglePreview);
         }
         if intents.ctrl_e && !overlay_active {
@@ -2767,6 +2994,79 @@ impl FerritorApp {
         intents: &CollectedIntents,
         kb_active: bool,
     ) -> bool {
+        if self.save_conflict {
+            if self.dialog_tab
+                || ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft))
+                || ctx.input(|i| i.key_pressed(egui::Key::ArrowRight))
+            {
+                self.conflict_focus = (self.conflict_focus + 1) % 2;
+            }
+            let keep_key = ctx.input(|i| {
+                !i.modifiers.ctrl && i.key_pressed(egui::Key::K)
+            });
+            let load_key = ctx.input(|i| {
+                !i.modifiers.ctrl && i.key_pressed(egui::Key::L)
+            });
+            if keep_key {
+                self.conflict_focus = 0;
+            }
+            if load_key {
+                self.conflict_focus = 1;
+            }
+
+            let mut keep_clicked = false;
+            let mut load_clicked = false;
+            let accent = self.theme.accent();
+            let focus_stroke = egui::Stroke::new(2.0_f32, accent);
+            let file_name = self
+                .selected_file
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "This file".to_string());
+
+            egui::Window::new("Changed on Disk")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("{file_name} changed on disk while you were editing."));
+                    ui.label("Choose which version to keep. Escape will not dismiss this decision.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        keep_clicked = ui
+                            .add(
+                                egui::Button::new("(K)eep mine").stroke(
+                                    if self.conflict_focus == 0 {
+                                        focus_stroke
+                                    } else {
+                                        egui::Stroke::NONE
+                                    },
+                                ),
+                            )
+                            .clicked();
+                        load_clicked = ui
+                            .add(
+                                egui::Button::new("(L)oad disk").stroke(
+                                    if self.conflict_focus == 1 {
+                                        focus_stroke
+                                    } else {
+                                        egui::Stroke::NONE
+                                    },
+                                ),
+                            )
+                            .clicked();
+                    });
+                });
+
+            if keep_clicked || keep_key || (intents.key_enter && self.conflict_focus == 0) {
+                self.apply_action(ctx, AppAction::ConflictKeepMine);
+            } else if load_clicked || load_key || (intents.key_enter && self.conflict_focus == 1) {
+                self.apply_action(ctx, AppAction::ConflictLoadDisk);
+            }
+            return true;
+        }
+
         // Dirty nav dialog
         if let Some(target) = self.dirty_nav_target.clone() {
             // Tab cycles focus, S/D/C move focus to their button
@@ -2792,7 +3092,7 @@ impl FerritorApp {
 
             let enter = intents.key_enter;
             let accent = self.theme.accent();
-            let focus_stroke = egui::Stroke::new(2.0, accent);
+            let focus_stroke = egui::Stroke::new(2.0_f32, accent);
 
             egui::Window::new("Unsaved Changes")
                 .collapsible(false)
@@ -3230,7 +3530,7 @@ impl FerritorApp {
                 .frame(
                     egui::Frame::new()
                         .fill(self.theme.popover_bg())
-                        .stroke(egui::Stroke::new(1.0, self.theme.border())),
+                        .stroke(egui::Stroke::new(1.0_f32, self.theme.border())),
                 )
                 .show(ctx, |ui| {
                     let key_color = self.theme.popover_fg();
@@ -3605,6 +3905,14 @@ impl FerritorApp {
 impl eframe::App for FerritorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_theme_if_needed(ctx);
+        self.refresh_selected_file_if_needed(ctx);
+
+        if ctx.input(|input| input.viewport().close_requested()) && self.is_dirty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.dirty_nav_target.is_none() {
+                self.set_dirty_nav(DirtyNavTarget::QuitApp);
+            }
+        }
 
         let title = match self
             .selected_file
@@ -3657,7 +3965,7 @@ impl eframe::App for FerritorApp {
             .frame(
                 egui::Frame::new()
                     .fill(self.theme.headerbar_bg())
-                    .stroke(egui::Stroke::new(1.0, self.theme.headerbar_border())),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.headerbar_border())),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -3683,7 +3991,7 @@ impl eframe::App for FerritorApp {
             .frame(
                 egui::Frame::new()
                     .fill(self.theme.card_bg())
-                    .stroke(egui::Stroke::new(1.0, self.theme.border())),
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.border())),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -3754,7 +4062,7 @@ impl eframe::App for FerritorApp {
 
         // --- Panels ---
 
-        let focus_stroke = egui::Stroke::new(2.0, self.theme.accent());
+        let focus_stroke = egui::Stroke::new(2.0_f32, self.theme.accent());
         let no_stroke = egui::Stroke::NONE;
         let sidebar_frame = egui::Frame::side_top_panel(ctx.style().as_ref())
             .fill(self.theme.card_bg())
@@ -3783,7 +4091,11 @@ impl eframe::App for FerritorApp {
                         && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.any_click())
                     {
-                        self.focus_pane = FocusPane::Files;
+                        if self.is_dirty() {
+                            self.set_dirty_nav(DirtyNavTarget::FocusFiles);
+                        } else {
+                            self.focus_pane = FocusPane::Files;
+                        }
                     }
 
                     ui.horizontal(|ui| {
@@ -3902,7 +4214,7 @@ impl eframe::App for FerritorApp {
                                     self.refresh_nav_rows();
                                 }
                                 FileRowKind::File => {
-                                    self.open_file(row.path.clone());
+                                    self.try_open_row(&row);
                                 }
                                 FileRowKind::Parent => {
                                     self.try_open_row(&row);
@@ -3956,11 +4268,10 @@ impl eframe::App for FerritorApp {
                                 )
                                 .clicked()
                             {
-                                self.undo_history.push_snapshot(&self.edit_buffer);
-                                self.exit_edit_mode(true);
+                                let _ = self.exit_edit_mode(true);
                             }
 
-                            if self.selected_file_is_markdown() && !self.editing {
+                            if self.selected_file_is_markdown() {
                                 let preview_label = if self.show_preview {
                                     format!("{} Raw", icons::CODE)
                                 } else {
@@ -4040,111 +4351,105 @@ impl eframe::App for FerritorApp {
                         return;
                     }
 
-                    let scroll_delta = self.viewer_scroll_delta;
-                    let scroll_out = egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.viewer_line_height_px =
-                            ui.text_style_height(&egui::TextStyle::Monospace);
-                        if self.editing {
-                            let editor_id = egui::Id::new("viewer_editor");
-                            let highlighter = &self.syntax_highlighter;
-                            let path_for_layout = path.clone();
-                            let mut layouter =
-                                move |ui: &egui::Ui,
-                                      text: &dyn egui::TextBuffer,
-                                      wrap_width: f32| {
-                                    let mut job =
-                                        highlighter.highlight(text.as_str(), &path_for_layout);
-                                    job.wrap.max_width = wrap_width;
-                                    ui.fonts_mut(|fonts| fonts.layout_job(job))
-                                };
-                            let te_resp = ui.add(
-                                egui::TextEdit::multiline(&mut self.edit_buffer)
-                                    .id(editor_id)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .code_editor()
-                                    .layouter(&mut layouter),
-                            );
-                            if self.editor_wants_focus {
-                                te_resp.request_focus();
-                                // Place cursor at requested edit-entry anchor.
-                                if let Some(cursor_char) = self.pending_editor_cursor_char.take() {
-                                    if let Some(mut state) =
-                                        egui::TextEdit::load_state(ui.ctx(), editor_id)
-                                    {
-                                        state.cursor.set_char_range(Some(
-                                            egui::text::CCursorRange::one(
-                                                egui::text::CCursor::new(cursor_char),
-                                            ),
-                                        ));
-                                        state.store(ui.ctx(), editor_id);
-                                    }
-                                }
-                                self.editor_wants_focus = false;
-                            }
-                        } else if self.show_preview && self.selected_file_is_markdown() {
-                            if let Some(content) = &self.loaded_content {
-                                // Use custom viewer with table support
-                                crate::markdown_viewer::show_with_tables(
-                                    ui,
-                                    &mut self.commonmark_cache,
-                                    content,
-                                    self.heading_color,
-                                );
-                            }
-                        } else if let Some(content) = &self.loaded_content {
-                            let highlighter = &self.syntax_highlighter;
-                            let mut job = highlighter.highlight(content, &path);
-                            if self.show_doc_find {
-                                if let Some(match_start) = self.doc_find_cursor_char {
-                                    apply_layout_job_find_highlight(
-                                        &mut job,
+                    let live_preview =
+                        self.editing && self.show_preview && self.selected_file_is_markdown();
+                    if live_preview {
+                        let pane_height = ui.available_height();
+                        ui.columns(2, |columns| {
+                            egui::ScrollArea::both()
+                                .id_salt("live_editor_scroll")
+                                .max_height(pane_height)
+                                .auto_shrink([false, false])
+                                .show(&mut columns[0], |ui| self.show_editor(ui, &path));
+
+                            let preview_width = columns[1].available_width();
+                            columns[1].set_min_width(preview_width);
+                            columns[1].set_max_width(preview_width);
+                            egui::ScrollArea::both()
+                                .id_salt("live_preview_scroll")
+                                .max_height(pane_height)
+                                .auto_shrink([false, false])
+                                .show(&mut columns[1], |ui| {
+                                    crate::markdown_viewer::show_with_tables(
+                                        ui,
+                                        &mut self.commonmark_cache,
+                                        &self.edit_buffer,
+                                        self.heading_color,
+                                    );
+                                });
+                        });
+                    } else {
+                        let scroll_delta = self.viewer_scroll_delta;
+                        let scroll_out = egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.viewer_line_height_px =
+                                ui.text_style_height(&egui::TextStyle::Monospace);
+                            if self.editing {
+                                self.show_editor(ui, &path);
+                            } else if self.show_preview && self.selected_file_is_markdown() {
+                                if let Some(content) = &self.loaded_content {
+                                    crate::markdown_viewer::show_with_tables(
+                                        ui,
+                                        &mut self.commonmark_cache,
                                         content,
-                                        match_start,
-                                        self.doc_find_query.chars().count(),
-                                        self.theme.selection_bg(),
+                                        self.heading_color,
                                     );
                                 }
+                            } else if let Some(content) = &self.loaded_content {
+                                let highlighter = &self.syntax_highlighter;
+                                let mut job = highlighter.highlight(content, &path);
+                                if self.show_doc_find {
+                                    if let Some(match_start) = self.doc_find_cursor_char {
+                                        apply_layout_job_find_highlight(
+                                            &mut job,
+                                            content,
+                                            match_start,
+                                            self.doc_find_query.chars().count(),
+                                            self.theme.selection_bg(),
+                                        );
+                                    }
+                                }
+                                ui.add(egui::Label::new(job).selectable(true));
                             }
-                            ui.add(egui::Label::new(job).selectable(true));
+                        });
+
+                        let mut final_offset = scroll_out.state.offset.y;
+                        if scroll_delta != 0.0 {
+                            let new_offset = (final_offset + scroll_delta).max(0.0);
+                            let mut state = scroll_out.state;
+                            state.offset.y = new_offset;
+                            state.store(ui.ctx(), scroll_out.id);
+                            final_offset = new_offset;
                         }
-                    });
+                        self.viewer_scroll_y = final_offset;
 
-                    let mut final_offset = scroll_out.state.offset.y;
-                    if scroll_delta != 0.0 {
-                        let new_offset = (final_offset + scroll_delta).max(0.0);
-                        let mut state = scroll_out.state;
-                        state.offset.y = new_offset;
-                        state.store(ui.ctx(), scroll_out.id);
-                        final_offset = new_offset;
-                    }
-                    self.viewer_scroll_y = final_offset;
-
-                    // Capture center-of-viewport char anchor from the same content/layout path
-                    // used by the raw text viewer and the final applied scroll offset.
-                    if !self.editing && !(self.show_preview && self.selected_file_is_markdown()) {
-                        if let Some(content) = &self.loaded_content {
-                            let highlighter = &self.syntax_highlighter;
-                            let job = highlighter.highlight(content, &path);
-                            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                            if let Some(target_char) = self.pending_viewer_scroll_char.take() {
-                                let char_count = content.chars().count();
-                                let target_cursor =
-                                    egui::text::CCursor::new(target_char.min(char_count));
-                                let target_rect = galley.pos_from_cursor(target_cursor);
-                                let target_offset = (target_rect.center().y
-                                    - (scroll_out.inner_rect.height() * 0.5))
-                                    .max(0.0);
-                                let mut state = scroll_out.state;
-                                state.offset.y = target_offset;
-                                state.store(ui.ctx(), scroll_out.id);
-                                final_offset = target_offset;
-                                self.viewer_scroll_y = final_offset;
+                        // Capture center-of-viewport char anchor from the same content/layout path
+                        // used by the raw text viewer and the final applied scroll offset.
+                        if !self.editing
+                            && !(self.show_preview && self.selected_file_is_markdown())
+                        {
+                            if let Some(content) = &self.loaded_content {
+                                let highlighter = &self.syntax_highlighter;
+                                let job = highlighter.highlight(content, &path);
+                                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                                if let Some(target_char) = self.pending_viewer_scroll_char.take() {
+                                    let char_count = content.chars().count();
+                                    let target_cursor =
+                                        egui::text::CCursor::new(target_char.min(char_count));
+                                    let target_rect = galley.pos_from_cursor(target_cursor);
+                                    let target_offset = (target_rect.center().y
+                                        - (scroll_out.inner_rect.height() * 0.5))
+                                        .max(0.0);
+                                    let mut state = scroll_out.state;
+                                    state.offset.y = target_offset;
+                                    state.store(ui.ctx(), scroll_out.id);
+                                    final_offset = target_offset;
+                                    self.viewer_scroll_y = final_offset;
+                                }
+                                let anchor_y = final_offset.max(0.0)
+                                    + (scroll_out.inner_rect.height() * 0.5);
+                                self.viewer_top_char =
+                                    galley.cursor_from_pos(egui::vec2(0.0, anchor_y)).index;
                             }
-                            let anchor_y =
-                                final_offset.max(0.0) + (scroll_out.inner_rect.height() * 0.5);
-                            self.viewer_top_char =
-                                galley.cursor_from_pos(egui::vec2(0.0, anchor_y)).index;
                         }
                     }
                 } else {
@@ -4666,7 +4971,7 @@ fn apply_egui_visuals(ctx: &egui::Context, theme: &GtkTheme) {
     visuals.weak_text_color = Some(theme.muted_fg());
     visuals.panel_fill = theme.view_bg();
     visuals.window_fill = theme.dialog_bg();
-    visuals.window_stroke = egui::Stroke::new(1.0, theme.border());
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, theme.border());
     visuals.extreme_bg_color = theme.view_bg();
     visuals.faint_bg_color = theme.shade();
     visuals.text_edit_bg_color = Some(theme.view_bg());
@@ -4674,28 +4979,28 @@ fn apply_egui_visuals(ctx: &egui::Context, theme: &GtkTheme) {
     visuals.warn_fg_color = theme.warning();
     visuals.error_fg_color = theme.error();
     visuals.selection.bg_fill = theme.selection_bg();
-    visuals.selection.stroke = egui::Stroke::new(1.0, theme.selection_stroke());
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, theme.selection_stroke());
     visuals.widgets.noninteractive.bg_fill = theme.view_bg();
     visuals.widgets.noninteractive.weak_bg_fill = theme.view_bg();
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.border());
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.view_fg());
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, theme.border());
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, theme.view_fg());
     visuals.widgets.inactive.bg_fill = theme.card_bg();
     visuals.widgets.inactive.weak_bg_fill = theme.card_bg();
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme.border());
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.card_fg());
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, theme.border());
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, theme.card_fg());
     visuals.widgets.hovered.bg_fill = theme.hover_bg();
     visuals.widgets.hovered.weak_bg_fill = theme.hover_bg();
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme.accent());
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2, theme.view_fg());
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, theme.accent());
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2_f32, theme.view_fg());
     visuals.widgets.active.bg_fill = theme.accent();
     visuals.widgets.active.weak_bg_fill = theme.accent();
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme.accent());
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2, theme.accent_fg());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, theme.accent());
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2_f32, theme.accent_fg());
     visuals.widgets.open.bg_fill = theme.popover_bg();
     visuals.widgets.open.weak_bg_fill = theme.popover_bg();
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme.border());
-    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, theme.popover_fg());
-    visuals.text_cursor.stroke = egui::Stroke::new(2.0, theme.accent());
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, theme.border());
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, theme.popover_fg());
+    visuals.text_cursor.stroke = egui::Stroke::new(2.0_f32, theme.accent());
     ctx.set_visuals(visuals);
 }
 
@@ -4759,30 +5064,46 @@ fn paint_cursor_bar(ui: &mut egui::Ui, resp: &egui::Response, color: egui::Color
 }
 
 fn unique_path(path: PathBuf) -> PathBuf {
-    if !path.exists() {
+    if !path_is_taken(&path) {
         return path;
     }
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|e| e.to_str());
     let parent = path.parent().unwrap_or(Path::new("."));
-    for i in 1..100 {
+    let mut i = 1_u64;
+    loop {
         let name = match ext {
             Some(e) => format!("{} ({}).{}", stem, i, e),
             None => format!("{} ({})", stem, i),
         };
         let candidate = parent.join(name);
-        if !candidate.exists() {
+        if !path_is_taken(&candidate) {
             return candidate;
         }
+        i = i.saturating_add(1);
     }
-    path
+}
+
+fn path_is_taken(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if src.is_dir() {
+    let metadata = fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to copy a symbolic link",
+        ));
+    }
+    if metadata.is_dir() {
         copy_dir_recursive(src, dst)
     } else {
-        fs::copy(src, dst).map(|_| ())
+        copy_file_exclusive(src, dst)
     }
 }
 
@@ -4812,18 +5133,242 @@ fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            fs::copy(&src_path, &dst_path)?;
+    fs::create_dir(dst)?;
+    let copied = (|| {
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                copy_file_exclusive(&src_path, &dst_path)?;
+            }
         }
+        Ok(())
+    })();
+    if let Err(err) = copied {
+        let _ = fs::remove_dir_all(dst);
+        return Err(err);
     }
     Ok(())
+}
+
+fn copy_file_exclusive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut source = File::open(src)?;
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut destination = options.open(dst)?;
+    let copied = (|| {
+        destination.set_permissions(source.metadata()?.permissions())?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()
+    })();
+    if let Err(err) = copied {
+        let _ = fs::remove_file(dst);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn valid_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
+}
+
+fn file_contents_changed(path: &Path, baseline: &Option<String>) -> bool {
+    fs::read_to_string(path).ok() != *baseline
+}
+
+fn rewrite_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    path.strip_prefix(from)
+        .map(|relative| to.join(relative))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn rewrite_paths(paths: &mut [PathBuf], from: &Path, to: &Path) {
+    for path in paths {
+        *path = rewrite_path(path, from, to);
+    }
+}
+
+fn rewrite_path_set(paths: &HashSet<PathBuf>, from: &Path, to: &Path) -> HashSet<PathBuf> {
+    paths
+        .iter()
+        .map(|path| rewrite_path(path, from, to))
+        .collect()
+}
+
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    let (temp_path, mut temp_file) = loop {
+        let id = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".ferritor-{}-{id}.tmp",
+            std::process::id()
+        ));
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    };
+
+    let written = (|| {
+        match fs::metadata(path) {
+            Ok(metadata) => temp_file.set_permissions(metadata.permissions())?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        temp_file.write_all(contents.as_bytes())?;
+        temp_file.sync_all()
+    })();
+
+    match written.and_then(|()| fs::rename(&temp_path, path)) {
+        Ok(()) => File::open(parent).and_then(|directory| directory.sync_all()),
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod filesystem_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ferritor-{name}-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn atomic_write_replaces_contents_without_leaving_a_temp_file() {
+        let dir = TestDir::new("atomic-write");
+        let note = dir.0.join("note.md");
+        fs::write(&note, "before").unwrap();
+
+        write_atomic(&note, "after").unwrap();
+
+        assert_eq!(fs::read_to_string(&note).unwrap(), "after");
+        let names: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("note.md")]);
+    }
+
+    #[test]
+    fn conflict_check_compares_contents_instead_of_metadata() {
+        let dir = TestDir::new("conflict");
+        let note = dir.0.join("note.md");
+        let baseline = Some("same contents".to_string());
+        fs::write(&note, "same contents").unwrap();
+        assert!(!file_contents_changed(&note, &baseline));
+
+        fs::write(&note, "changed contents").unwrap();
+        assert!(file_contents_changed(&note, &baseline));
+    }
+
+    #[test]
+    fn names_cannot_escape_their_parent() {
+        for invalid in ["", " ", ".", "..", "../note", "a/b", "a\\b", "bad\nname"] {
+            assert!(!valid_name(invalid), "accepted {invalid:?}");
+        }
+        for valid in ["note.md", ".hidden.md", "two words"] {
+            assert!(valid_name(valid), "rejected {valid:?}");
+        }
+    }
+
+    #[test]
+    fn unique_path_has_no_ninety_nine_collision_fallback() {
+        let dir = TestDir::new("unique");
+        fs::write(dir.0.join("note.md"), "").unwrap();
+        for number in 1..=105 {
+            fs::write(dir.0.join(format!("note ({number}).md")), "").unwrap();
+        }
+        assert_eq!(unique_path(dir.0.join("note.md")), dir.0.join("note (106).md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_skips_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new("copy-links");
+        let source = dir.0.join("source");
+        let destination = dir.0.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("note.md"), "safe").unwrap();
+        symlink(&dir.0, source.join("loop")).unwrap();
+
+        copy_dir_recursive(&source, &destination).unwrap();
+
+        assert_eq!(fs::read_to_string(destination.join("note.md")).unwrap(), "safe");
+        assert!(!destination.join("loop").exists());
+    }
+
+    #[test]
+    fn copy_collision_never_overwrites_the_destination() {
+        let dir = TestDir::new("copy-collision");
+        let source = dir.0.join("source.md");
+        let destination = dir.0.join("destination.md");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "existing").unwrap();
+
+        assert!(copy_file_exclusive(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(destination).unwrap(), "existing");
+    }
+
+    #[test]
+    fn path_rewrite_follows_a_moved_directory() {
+        let from = Path::new("/vault/old");
+        let to = Path::new("/vault/new");
+        assert_eq!(
+            rewrite_path(Path::new("/vault/old/nested/note.md"), from, to),
+            PathBuf::from("/vault/new/nested/note.md")
+        );
+        assert_eq!(
+            rewrite_path(Path::new("/vault/other.md"), from, to),
+            PathBuf::from("/vault/other.md")
+        );
+    }
 }
 
 fn load_fonts(ctx: &egui::Context) {

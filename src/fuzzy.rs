@@ -5,6 +5,7 @@ use std::time::Instant;
 
 const MAX_INDEXED_FILES: usize = 50_000;
 const MAX_RESULTS: usize = 200;
+const INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Directories to skip during fuzzy search indexing.
 /// These are high-volume directories that slow down indexing without
@@ -253,6 +254,7 @@ pub struct FuzzyResult {
 pub struct FuzzySearch {
     root: PathBuf,
     indexed_for_root: Option<PathBuf>,
+    indexed_at: Option<Instant>,
     candidates: Vec<PathBuf>,
     labels: Vec<String>,
     results: Vec<FuzzyResult>,
@@ -265,11 +267,19 @@ pub struct FuzzySearch {
 impl FuzzySearch {
     pub fn open_for_root(&mut self, root: PathBuf){
         self.root = root.clone();
-        if self.indexed_for_root.as_ref() != Some(&root){
+        let stale = self
+            .indexed_at
+            .is_none_or(|indexed_at| indexed_at.elapsed() >= INDEX_TTL);
+        if self.indexed_for_root.as_ref() != Some(&root) || stale {
             self.rebuild_index();
         } else {
             self.recompute_results();
         }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.indexed_for_root = None;
+        self.indexed_at = None;
     }
 
     pub fn set_query(&mut self, query: String){
@@ -338,6 +348,7 @@ impl FuzzySearch {
         }
 
         self.indexed_for_root = Some(self.root.clone());
+        self.indexed_at = Some(Instant::now());
         self.last_index_ms = started.elapsed().as_millis();
         self.recompute_results();
     }

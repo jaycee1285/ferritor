@@ -193,7 +193,6 @@ pub struct ExtRow {
 pub struct ExtTable {
     pub rows: Vec<ExtRow>,
     pub num_cols: usize,
-    pub col_aligns: Vec<Alignment>,
     pub col_widths: Vec<Option<u8>>,
 }
 
@@ -265,7 +264,7 @@ fn parse_extended_table(md: &str) -> Option<ExtTable> {
         }
     }
 
-    Some(ExtTable { rows, num_cols, col_aligns, col_widths })
+    Some(ExtTable { rows, num_cols, col_widths })
 }
 
 fn is_separator_row(line: &str) -> bool {
@@ -732,7 +731,7 @@ fn render_extended_table(ui: &mut egui::Ui, table: &ExtTable) {
             painter.rect_stroke(
                 cell_rect,
                 0.0,
-                egui::Stroke::new(1.0, border_color),
+                egui::Stroke::new(1.0_f32, border_color),
                 egui::StrokeKind::Inside,
             );
 
@@ -1108,7 +1107,9 @@ mod tests {
         let table = parse_extended_table(md).unwrap();
         assert_eq!(table.num_cols, 3);
         assert_eq!(table.col_widths, vec![Some(10), Some(20), Some(50)]);
-        assert_eq!(table.col_aligns, vec![Alignment::None, Alignment::Center, Alignment::Right]);
+        assert_eq!(table.rows[0].cells[0].alignment, Alignment::None);
+        assert_eq!(table.rows[0].cells[1].alignment, Alignment::Center);
+        assert_eq!(table.rows[0].cells[2].alignment, Alignment::Right);
     }
 
     #[test]
@@ -1116,9 +1117,9 @@ mod tests {
         let md = "| A | B | C | D |\n|-|:-|-:|:-:|\n| 1 | 2 | 3 | 4 |";
         let table = parse_extended_table(md).unwrap();
         assert_eq!(table.num_cols, 4);
-        assert_eq!(table.col_aligns[0], Alignment::None);
-        assert_eq!(table.col_aligns[1], Alignment::Left);
-        assert_eq!(table.col_aligns[2], Alignment::Right);
-        assert_eq!(table.col_aligns[3], Alignment::Center);
+        assert_eq!(table.rows[0].cells[0].alignment, Alignment::None);
+        assert_eq!(table.rows[0].cells[1].alignment, Alignment::Left);
+        assert_eq!(table.rows[0].cells[2].alignment, Alignment::Right);
+        assert_eq!(table.rows[0].cells[3].alignment, Alignment::Center);
     }
 }

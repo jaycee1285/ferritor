@@ -55,7 +55,7 @@
   version = "0.1.0";
   src = cleanSrc;
 
-  cargoHash = "sha256-OdTqNKxZtA39r5cQYKFAvW9P+Fv/LE2racTH1MCnH9c=";
+  cargoHash = "sha256-6qqKKQ+mwehOZsX1Fk3twzM3Eu4B9r5rhEVK8ZooBes=";
 
   nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
   buildInputs = nativeDeps;

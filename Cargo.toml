@@ -10,15 +10,11 @@ syntect = "5.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
-walkdir = "2"
 ignore = "0.4"
-egui_ltreeview = "0.6"
 egui-phosphor = { version = "0.11.0", features = ["regular"] }
 egui_commonmark = { version = "0.22.0", features = ["better_syntax_highlighting"] }
 egui-file-dialog = "0.12.0"
 egui-shadcn = "0.5.0"
 frizbee = "0.9.0"
 pulldown-cmark = "0.12"
-egui_deferred_table = "0.1.7"
-egui-data-table = "0.10.0"
 accesskit_atspi_common = "=0.14.2"
