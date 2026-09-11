@@ -1,5 +1,20 @@
+# Cargo build output.
 /target/
+**/*.rs.bk
+*.pdb
+
+# Nix build output (nix build symlinks, direnv cache).
 result
+result-*
+.direnv/
+
+# Release artifacts (release.sh).
+/ferritor-*.tar.xz
+
+# Profiling output.
+perf.data*
+flamegraph.svg
+
 status.yaml
 
 # Local cloned/reference repos (session-only).
